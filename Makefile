@@ -1,5 +1,5 @@
 app: main.cpp
-	g++ -std=c++23 main.cpp -lvulkan -lglfw -o app
+	g++ -g -std=c++23 main.cpp -lvulkan -lglfw -o app
 
 run: app
 	./app
