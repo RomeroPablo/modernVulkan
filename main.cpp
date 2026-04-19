@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vulkan/vulkan_core.h>
 
 #define VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
 #include <vulkan/vulkan.hpp>
@@ -53,10 +54,31 @@ void Vulkan::run(){
     close();
 };
 
+std::vector<const char* > requiredDeviceExtension = {vk::KHRSwapchainExtensionName};
+bool isDeviceSuitable(vk::raii::PhysicalDevice const& physicalDevice){
+    bool supportsVulkan1_3 = physicalDevice.getProperties().apiVersion >= vk::ApiVersion13;
+    auto queueFamilies = physicalDevice.getQueueFamilyProperties();
+    bool supportsGraphics = std::ranges::any_of(queueFamilies, [](auto const & qfp) {return !!(qfp.queueFlags & vk::QueueFlagBits::eGraphics);});
+    auto availableDeviceExtensions = physicalDevice.enumerateDeviceExtensionProperties();
+    bool supportsAllRequiredExtensions =
+    std::ranges::all_of(requiredDeviceExtension, [&availableDeviceExtensions]( auto const & requiredDeviceExtension ){
+        return std::ranges::any_of( availableDeviceExtensions, [requiredDeviceExtension]( auto const & availableDeviceExtension ){
+                return strcmp( availableDeviceExtension.extensionName, requiredDeviceExtension ) == 0; } );
+        });
+      auto features =
+    physicalDevice.template getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+    bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
+                                  features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
+  // Return true if the physicalDevice meets all the criteria
+  return supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsRequiredFeatures;
+}
+
 void Vulkan::pickPhysicalDevice(){
-    auto physicalDeviceList = instance.enumeratePhysicalDevices();
-    physicalDevice = physicalDeviceList[0];
-    physicalDeviceProperties = physicalDevice.getProperties();
+    std::vector<vk::raii::PhysicalDevice> physicalDevices = instance.enumeratePhysicalDevices();
+    auto const devIter = std::ranges::find_if( physicalDevices, [&](auto const &physicalDevice){
+            return isDeviceSuitable(physicalDevice);});
+        if( devIter == physicalDevices.end()) { throw std::runtime_error("failed to find suitable device"); }
+        physicalDevice = *devIter;
 };
 
 void Vulkan::initWindow(){
