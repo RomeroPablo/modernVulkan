@@ -49,7 +49,7 @@ $(COMPILE_COMMANDS): $(DB_FRAGMENT)
 	sed '$$s/,$$//' $^ >> $@
 	printf '\n]\n' >> $@
 
-run: $(TARGET)
+run: build
 	./$(TARGET)
 
 format:
