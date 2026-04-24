@@ -41,6 +41,9 @@ export struct Vulkan {
   GLFWwindow *window = nullptr;
   uint32_t width = 800;
   uint32_t height = 600;
+  uint32_t framebufferResized = false;
+  uint32_t frames_in_flight = 2;
+  uint32_t frameIndex = 0;
   vk::raii::Context context = {};
   vk::raii::Instance instance = nullptr;
   vk::raii::DebugUtilsMessengerEXT debugMessenger = nullptr;
@@ -61,10 +64,10 @@ export struct Vulkan {
   vk::raii::PipelineLayout pipelineLayout = nullptr;
   vk::raii::Pipeline graphicsPipeline = nullptr;
   vk::raii::CommandPool commandPool = nullptr;
-  vk::raii::CommandBuffer commandBuffer = nullptr;
-  vk::raii::Semaphore presentCompleteSemaphore = nullptr;
-  vk::raii::Semaphore renderFinishedSemaphore = nullptr;
-  vk::raii::Fence drawFence = nullptr;
+  std::vector<vk::raii::CommandBuffer> commandBuffers = {};
+  std::vector<vk::raii::Semaphore> presentCompleteSemaphores = {};
+  std::vector<vk::raii::Semaphore> renderFinishedSemaphores = {};
+  std::vector<vk::raii::Fence> inFlightFences = {};
 
   void run();
   void mainLoop();
@@ -83,7 +86,11 @@ export struct Vulkan {
   void createCommandBuffer();
   void recordCommandBuffer(uint32_t imageIndex);
   void setupDebugMessenger();
+  void recreateSwapchain();
+  void cleanupSwapchain();
 
+  static void framebufferResizeCallback(GLFWwindow *window, int width,
+                                        int height);
   std::vector<const char *> getRequiredInstanceExtensions();
   std::vector<const char *> getRequiredInstanceLayers();
   vk::SurfaceFormatKHR chooseSwapSurfaceFormat(
@@ -153,9 +160,7 @@ void Vulkan::run() {
   if (window == nullptr) {
     throw std::runtime_error("no window found");
   };
-  logs("Running");
   initVulkan();
-  logs("Initialized Vulkan");
   mainLoop();
 }
 
@@ -167,15 +172,24 @@ void Vulkan::mainLoop() {
   device.waitIdle();
 };
 void Vulkan::drawFrame() {
-  auto fenceResult = device.waitForFences(*drawFence, vk::True, UINT64_MAX);
-  if (fenceResult != vk::Result::eSuccess) {
+  auto fenceResult =
+      device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
+  if (fenceResult != vk::Result::eSuccess)
     throw std::runtime_error("failed to wait for fence!");
-  }
-  device.resetFences(*drawFence);
 
   auto [result, imageIndex] = swapChain.acquireNextImage(
-      UINT64_MAX, *presentCompleteSemaphore, nullptr);
+      UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+  if (result == vk::Result::eErrorOutOfDateKHR) {
+    recreateSwapchain();
+    return;
+  }
+  if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
+    assert(result == vk::Result::eTimeout || result == vk::Result::eNotReady);
+    throw std::runtime_error("failed to acquire swap chain image!");
+  }
+  device.resetFences(*inFlightFences[frameIndex]);
 
+  commandBuffers[frameIndex].reset();
   recordCommandBuffer(imageIndex);
 
   graphicsQueue.waitIdle();
@@ -184,31 +198,29 @@ void Vulkan::drawFrame() {
       vk::PipelineStageFlagBits::eColorAttachmentOutput);
   const vk::SubmitInfo submitInfo{
       .waitSemaphoreCount = 1,
-      .pWaitSemaphores = &*presentCompleteSemaphore,
+      .pWaitSemaphores = &*presentCompleteSemaphores[frameIndex],
       .pWaitDstStageMask = &waitDestinationStageMask,
       .commandBufferCount = 1,
-      .pCommandBuffers = &*commandBuffer,
+      .pCommandBuffers = &*commandBuffers[frameIndex],
       .signalSemaphoreCount = 1,
-      .pSignalSemaphores = &*renderFinishedSemaphore};
-  graphicsQueue.submit(submitInfo, *drawFence);
+      .pSignalSemaphores = &*renderFinishedSemaphores[frameIndex]};
+  graphicsQueue.submit(submitInfo, *inFlightFences[frameIndex]);
 
-  const vk::PresentInfoKHR presentInfoKHR{.waitSemaphoreCount = 1,
-                                          .pWaitSemaphores =
-                                              &*renderFinishedSemaphore,
-                                          .swapchainCount = 1,
-                                          .pSwapchains = &*swapChain,
-                                          .pImageIndices = &imageIndex};
+  const vk::PresentInfoKHR presentInfoKHR{
+      .waitSemaphoreCount = 1,
+      .pWaitSemaphores = &*renderFinishedSemaphores[frameIndex],
+      .swapchainCount = 1,
+      .pSwapchains = &*swapChain,
+      .pImageIndices = &imageIndex};
   result = graphicsQueue.presentKHR(presentInfoKHR);
-  switch (result) {
-  case vk::Result::eSuccess:
-    break;
-  case vk::Result::eSuboptimalKHR:
-    std::cout
-        << "vk::Queue::presentKHR returned vk::Result::eSuboptimalKHR !\n";
-    break;
-  default:
-    break;
+  if ((result == vk::Result::eSuboptimalKHR) ||
+      (result == vk::Result::eErrorOutOfDateKHR) || framebufferResized) {
+    framebufferResized = false;
+    recreateSwapchain();
+  } else {
+    assert(result == vk::Result::eSuccess);
   }
+  frameIndex = (frameIndex + 1) % frames_in_flight;
 };
 
 void Vulkan::pickPhysicalDevice() {
@@ -272,10 +284,18 @@ void Vulkan::createSurface() {
   surface = vk::raii::SurfaceKHR(instance, rawSurface);
 }
 
+void Vulkan::framebufferResizeCallback(GLFWwindow *window, int width,
+                                       int height) {
+  auto app = reinterpret_cast<Vulkan *>(glfwGetWindowUserPointer(window));
+  app->framebufferResized = true;
+};
+
 void Vulkan::initWindow(GLFWwindow *window, uint32_t width, uint32_t height) {
   this->window = window;
   this->width = width;
   this->height = height;
+  glfwSetWindowUserPointer(window, this);
+  glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
 }
 
 vk::SurfaceFormatKHR Vulkan::chooseSwapSurfaceFormat(
@@ -493,10 +513,9 @@ void Vulkan::createCommandBuffer() {
   vk::CommandBufferAllocateInfo allocInfo = {
       .commandPool = commandPool,
       .level = vk::CommandBufferLevel::ePrimary,
-      .commandBufferCount = 1,
+      .commandBufferCount = frames_in_flight,
   };
-  commandBuffer =
-      std::move(vk::raii::CommandBuffers(device, allocInfo).front());
+  commandBuffers = vk::raii::CommandBuffers(device, allocInfo);
 };
 
 void Vulkan::transition_image_layout(uint32_t imageIndex,
@@ -524,10 +543,11 @@ void Vulkan::transition_image_layout(uint32_t imageIndex,
   vk::DependencyInfo dependency_info = {.dependencyFlags = {},
                                         .imageMemoryBarrierCount = 1,
                                         .pImageMemoryBarriers = &barrier};
-  commandBuffer.pipelineBarrier2(dependency_info);
+  commandBuffers[frameIndex].pipelineBarrier2(dependency_info);
 }
 
 void Vulkan::recordCommandBuffer(uint32_t imageIndex) {
+  auto &commandBuffer = commandBuffers[frameIndex];
   commandBuffer.begin({});
 
   transition_image_layout(imageIndex, vk::ImageLayout::eUndefined,
@@ -567,12 +587,32 @@ void Vulkan::recordCommandBuffer(uint32_t imageIndex) {
 };
 
 void Vulkan::createSyncObjects() {
-  presentCompleteSemaphore =
-      vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
-  renderFinishedSemaphore =
-      vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
-  drawFence =
-      vk::raii::Fence(device, {.flags = vk::FenceCreateFlagBits::eSignaled});
+  for (size_t i = 0; i < swapChainImages.size(); i++)
+    renderFinishedSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+  for (size_t i = 0; i < frames_in_flight; i++) {
+    presentCompleteSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+    inFlightFences.emplace_back(
+        device,
+        vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
+  }
+};
+
+void Vulkan::recreateSwapchain() {
+  int width = 0, height = 0;
+  glfwGetFramebufferSize(window, &width, &height);
+  while (width == 0 || height == 0) {
+    glfwGetFramebufferSize(window, &width, &height);
+    glfwWaitEvents();
+  }
+  device.waitIdle();
+  cleanupSwapchain();
+  createSwapChain();
+  createImageViews();
+};
+
+void Vulkan::cleanupSwapchain() {
+  swapChainImageViews.clear();
+  swapChain = nullptr;
 };
 
 void Vulkan::initVulkan() {

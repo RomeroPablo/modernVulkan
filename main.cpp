@@ -8,7 +8,7 @@ import vulkan;
 int main() {
   glfwInit();
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-  glfwWindowHint(GLFW_RESIZABLE, false);
+  glfwWindowHint(GLFW_RESIZABLE, true);
   uint32_t width = 480, height = 480;
   GLFWwindow *window =
       glfwCreateWindow(width, height, "Modern Vulkan", nullptr, nullptr);
